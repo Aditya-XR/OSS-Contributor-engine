@@ -124,3 +124,31 @@ def test_read_snippet_returns_head(tmp_path):
 def test_read_snippet_handles_missing_file(tmp_path):
     snippet = read_snippet(tmp_path, "ghost.py", max_lines=10)
     assert "snippet read failed" in snippet
+
+
+@pytest.mark.unit
+def test_read_snippet_with_keywords_shows_the_matching_code(tmp_path):
+    lines = [f"line {i}" for i in range(300)]
+    lines[250] = "def refresh_session_token(user):"
+    (tmp_path / "x.py").write_text("\n".join(lines), encoding="utf-8")
+    snippet = read_snippet(
+        tmp_path, "x.py", max_lines=30, keywords=["refresh_session_token"],
+    )
+    out = snippet.split("\n")
+    assert len(out) <= 30
+    assert out[0] == "line 0"
+    assert "def refresh_session_token(user):" in out
+    assert any("not shown] ..." in line for line in out)
+
+
+@pytest.mark.unit
+def test_read_snippet_with_keywords_keeps_short_files_whole(tmp_path):
+    (tmp_path / "x.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
+    snippet = read_snippet(tmp_path, "x.py", max_lines=30, keywords=["zzz"])
+    assert snippet == "a = 1\nb = 2"
+
+
+@pytest.mark.unit
+def test_read_snippet_with_keywords_handles_missing_file(tmp_path):
+    snippet = read_snippet(tmp_path, "ghost.py", max_lines=10, keywords=["x"])
+    assert "snippet read failed" in snippet

@@ -40,7 +40,7 @@ log = structlog.get_logger(__name__)
 # accept while still giving the LLM real per-file context to rerank on.
 DEFAULT_TOP_K_SCAN = 12         # how many files survive the deterministic step
 DEFAULT_MAX_CANDIDATES = 8      # how many final candidates we return
-DEFAULT_SNIPPET_LINES = 50      # head-of-file slice we hand the LLM
+DEFAULT_SNIPPET_LINES = 50      # per-file excerpt we hand the LLM, in lines
 
 
 SYSTEM_PROMPT = """You are mapping a GitHub issue to the specific source files
@@ -50,7 +50,9 @@ You're given:
 - The issue (title + body + labels)
 - A pre-ranked candidate list (the deterministic pre-rank used path and
   keyword heuristics — your job is to confirm or correct it using the
-  snippet content)
+  snippet content). A long file's snippet shows its first lines plus the
+  lines that mention the issue's keywords; `... [lines 120-480 not shown] ...`
+  marks code that was skipped.
 
 Return ONE JSON object:
   "candidates": up to {max_candidates} entries, ordered by confidence desc.
@@ -165,6 +167,7 @@ async def explore(
         scanned=scanned,
         snippet_lines=snippet_lines,
         max_candidates=max_candidates,
+        keywords=keywords,
     )
     _result, parsed = call_llm(
         router,
@@ -254,6 +257,7 @@ def _build_user_message(
     scanned: list[ScannedFile],
     snippet_lines: int,
     max_candidates: int,
+    keywords: list[str] | None = None,
 ) -> str:
     body_excerpt = (issue_body or "").strip()
     if len(body_excerpt) > _MAX_BODY_CHARS:
@@ -263,7 +267,9 @@ def _build_user_message(
 
     file_blocks: list[str] = []
     for s in scanned:
-        snippet = read_snippet(repo_path, s.path, max_lines=snippet_lines)
+        snippet = read_snippet(
+            repo_path, s.path, max_lines=snippet_lines, keywords=keywords,
+        )
         signals_txt = ", ".join(s.signals) if s.signals else "(none)"
         file_blocks.append(
             f"--- {s.path}  "
