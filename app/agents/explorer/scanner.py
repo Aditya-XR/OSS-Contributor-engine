@@ -8,10 +8,12 @@ the prompt fits in the model's context window once we attach snippets.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 import structlog
 
+from app.agents._shared.excerpts import excerpt_text, read_text
 from app.agents._shared.file_filters import (
     MAX_BLOB_SIZE_BYTES,
     is_interesting_path,
@@ -112,9 +114,31 @@ def scan_workspace(
     return candidates[:top_k], examined
 
 
-def read_snippet(repo_path: Path, rel_path: str, *, max_lines: int = 80) -> str:
-    """First `max_lines` of the file, decoded with replacement on bad bytes."""
+def read_snippet(
+    repo_path: Path,
+    rel_path: str,
+    *,
+    max_lines: int = 80,
+    keywords: Sequence[str] | None = None,
+) -> str:
+    """At most `max_lines` lines of the file, decoded with replacement on bad
+    bytes.
+
+    Without `keywords` that's the head of the file. With them, a file too
+    long to show whole becomes an excerpt: its first few lines plus the lines
+    that mention the keywords (see `_shared/excerpts.py`), so the reranker
+    sees the code the issue is about rather than just the imports.
+    """
     full = repo_path / rel_path
+    if keywords:
+        try:
+            text = read_text(full)
+        except OSError as e:
+            return f"(snippet read failed: {e})"
+        return excerpt_text(
+            text, keywords=keywords, max_lines=max_lines,
+            head_lines=8, before=3, after=8,
+        ).text
     try:
         with full.open("r", encoding="utf-8", errors="replace") as f:
             lines: list[str] = []

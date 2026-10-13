@@ -1,7 +1,8 @@
 """Patch Writer — given an issue + Code Explorer candidates, produces edits.
 
 Flow:
-  1. Read the full content of every candidate file (truncate huge ones).
+  1. Read every candidate file. Small files go in whole; large ones are cut
+     down to the parts relevant to the issue (see `_shared/excerpts.py`).
   2. Build a structured prompt: issue + per-file blocks.
   3. Call the LLM with response_model=PatchAttempt.
   4. Validate + apply the proposed edits via the applier.
@@ -18,7 +19,9 @@ from pathlib import Path
 import structlog
 from sqlalchemy.orm import Session
 
+from app.agents._shared.excerpts import error_line_anchors, excerpt_text, read_text
 from app.agents.explorer.schemas import FileCandidate
+from app.agents.explorer.scorer import extract_keywords
 from app.agents.patcher.applier import apply_edits, capture_diff
 from app.agents.patcher.exceptions import EditApplyError, NoEditsError
 from app.agents.patcher.schemas import (
@@ -36,17 +39,19 @@ log = structlog.get_logger(__name__)
 # of context; runaway files (auto-generated SQL fixtures, vendored CSS)
 # would otherwise blow the context window.
 _MAX_FILE_CHARS = 12_000
-_MAX_FILE_LINES = 400
 
 # Global cap on TOTAL candidate-file content across the whole prompt. The
 # per-file cap alone let 3 large files balloon the request to ~8.8k tokens,
 # which Groq's free tier rejects when Gemini is down (8b caps at 6k TPM,
-# 70b at 12k). This shared budget is consumed highest-confidence-file-first
-# (candidates arrive sorted desc), so the most relevant code keeps its
-# context and the tail gets trimmed or omitted. ~16k chars ≈ 4k tokens,
-# which — with the issue body + system prompt + output reservation below —
-# keeps the whole request comfortably under the 70b cap and often the 8b's.
+# 70b at 12k). ~16k chars ≈ 4k tokens, which — with the issue body + system
+# prompt + output reservation below — keeps the whole request comfortably
+# under the 70b cap and often the 8b's. `_allocate_budgets` splits it across
+# the candidates by confidence; a file that fits its share is shown whole.
 _MAX_TOTAL_FILE_CHARS = 16_000
+
+# A file whose share of the budget is smaller than this is listed by name
+# only — an excerpt that small rarely holds a usable `search` target.
+_MIN_EXCERPT_CHARS = 600
 
 # Output token budget. Aider-style search/replace patches average ~500
 # tokens for small fixes. 1536 leaves headroom for multi-edit fixes while
@@ -63,7 +68,8 @@ SYSTEM_PROMPT = """You are fixing a GitHub issue by editing source files.
 
 You'll receive:
 - An issue (title + body + labels)
-- A short list of candidate source files (with full content)
+- A short list of candidate source files (small files in full; large files
+  as excerpts: the start of the file plus the parts relevant to the issue)
 
 Return JSON matching this shape:
 {
@@ -89,6 +95,10 @@ Search-and-replace rules — these matter:
   in `replace`. The `path` must be a path that doesn't yet exist.
 - Don't reformat code that isn't part of your fix. Don't reorder imports.
   Don't change unrelated lines.
+- In an excerpt, a line like `... [lines 120-480 not shown] ...` is a
+  placeholder, NOT file content. Never put it in `search`; only search for
+  text you can see. Hidden lines may repeat what you see, so keep `search`
+  specific.
 
 If you can't confidently fix this from the candidates given:
 - Return `"confidence": 0.0-0.3`
@@ -330,29 +340,54 @@ def _build_user_message(
 
     labels_line = ", ".join(issue_labels) if issue_labels else "(none)"
 
-    file_blocks: list[str] = []
-    remaining = _MAX_TOTAL_FILE_CHARS
+    # What the excerpts look for: the issue's keywords, plus — on a retry —
+    # the lines the previous attempt's errors point at.
+    keywords = extract_keywords(f"{issue_title} {issue_body or ''}")
+    failure_text = "\n".join(a.failure_excerpt for a in prior_attempts)
+
+    texts: list[str | None] = []
+    read_errors: list[str] = []
     for c in candidates:
-        if remaining <= 0:
-            # Global budget spent — name the file so the LLM knows it exists
-            # but don't ship its body (keeps us under free-tier TPM caps).
+        try:
+            texts.append(read_text(repo_path / c.path))
+            read_errors.append("")
+        except OSError as e:
+            texts.append(None)
+            read_errors.append(str(e))
+
+    budgets = _allocate_budgets(
+        [len(t) if t is not None else 0 for t in texts],
+        [c.confidence for c in candidates],
+        total=_MAX_TOTAL_FILE_CHARS,
+        per_file_cap=_MAX_FILE_CHARS,
+    )
+
+    file_blocks: list[str] = []
+    for c, text, error, budget in zip(
+        candidates, texts, read_errors, budgets, strict=True,
+    ):
+        header = f"--- {c.path}  (confidence={c.confidence:.2f}, {c.size_bytes}B)"
+        if text is None:
+            file_blocks.append(f"{header}\n(could not read file: {error})\n")
+            continue
+        if text and budget < _MIN_EXCERPT_CHARS and len(text) > budget:
+            # Too little budget left for a useful excerpt — name the file so
+            # the LLM knows it exists (keeps us under free-tier TPM caps).
             file_blocks.append(
-                f"--- {c.path}"
-                f"  (confidence={c.confidence:.2f}, {c.size_bytes}B)"
-                f"  (omitted — prompt size budget reached)\n",
+                f"{header}  (omitted — prompt size budget reached)\n",
             )
             continue
-        budget = min(_MAX_FILE_CHARS, remaining)
-        content, truncated = _read_file_for_prompt(
-            repo_path, c.path, max_chars=budget,
+        excerpt = excerpt_text(
+            text,
+            keywords=keywords,
+            anchor_lines=error_line_anchors(failure_text, c.path),
+            max_chars=budget,
         )
-        remaining -= len(content)
-        marker = "  (file truncated — only first portion shown)" if truncated else ""
-        file_blocks.append(
-            f"--- {c.path}"
-            f"  (confidence={c.confidence:.2f}, {c.size_bytes}B){marker}\n"
-            f"{content}\n",
+        marker = (
+            f"  (excerpt — {excerpt.shown_lines} of {excerpt.total_lines} lines shown)"
+            if excerpt.truncated else ""
         )
+        file_blocks.append(f"{header}{marker}\n{excerpt.text}\n")
 
     prior_block = _format_prior_attempts(prior_attempts) if prior_attempts else ""
 
@@ -394,28 +429,41 @@ def _format_prior_attempts(prior: list[PriorAttempt]) -> str:
     return "\n".join(parts)
 
 
-def _read_file_for_prompt(
-    repo_path: Path, rel_path: str, *, max_chars: int = _MAX_FILE_CHARS,
-) -> tuple[str, bool]:
-    """Return (text, truncated_flag). Truncated at line OR char limit.
+def _allocate_budgets(
+    sizes: list[int],
+    weights: list[float],
+    *,
+    total: int,
+    per_file_cap: int,
+) -> list[int]:
+    """Split `total` prompt characters across the candidate files.
 
-    `max_chars` lets the caller shrink a single file's slice to fit the
-    global per-prompt budget (see `_MAX_TOTAL_FILE_CHARS`)."""
-    full = repo_path / rel_path
-    try:
-        with full.open("r", encoding="utf-8", errors="replace") as f:
-            lines: list[str] = []
-            total_chars = 0
-            truncated = False
-            for i, line in enumerate(f):
-                if i >= _MAX_FILE_LINES or total_chars >= max_chars:
-                    truncated = True
-                    break
-                lines.append(line.rstrip("\n"))
-                total_chars += len(line)
-        return "\n".join(lines), truncated
-    except OSError as e:
-        return f"(could not read file: {e})", False
+    Water-filling by confidence: each file's share is proportional to its
+    weight; a file that needs less than its share gets exactly what it needs,
+    and the surplus is re-split among the rest. So small files are shown
+    whole, and large files share what's left — instead of the first large
+    file taking 12k chars and starving everything after it.
+    """
+    # Floor the weights so a 0.0-confidence file still gets a look-in.
+    w = [max(x, 0.05) for x in weights]
+    alloc = [0] * len(sizes)
+    open_ = list(range(len(sizes)))
+    remaining = total
+    while open_ and remaining > 0:
+        wsum = sum(w[i] for i in open_)
+        satisfied = [
+            i for i in open_
+            if min(sizes[i], per_file_cap) <= remaining * w[i] / wsum
+        ]
+        if not satisfied:
+            for i in open_:
+                alloc[i] = min(per_file_cap, int(remaining * w[i] / wsum))
+            break
+        for i in satisfied:
+            alloc[i] = min(sizes[i], per_file_cap)
+            remaining -= alloc[i]
+        open_ = [i for i in open_ if i not in satisfied]
+    return alloc
 
 
 # Imported but only re-exported for the CLI module — keep this stub for the
