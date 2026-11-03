@@ -98,6 +98,19 @@ def test_anchor_line_is_shown_without_any_keyword():
 
 
 @pytest.mark.unit
+def test_anchor_and_keyword_survive_tight_budget_when_head_is_large():
+    # A long licence/header in the first 15 lines must not crowd out an
+    # error anchor or rare keyword when max_chars is tight.
+    overrides = {i: "# " + ("licence header text " * 3) for i in range(1, 16)}
+    overrides[500] = "    broken_call = ("
+    text = _big_file(overrides=overrides)
+    ex = excerpt_text(text, anchor_lines=[500], max_chars=600)
+    assert len(ex.text) <= 600
+    shown = _rebuild(ex.text)
+    assert shown[500] == "    broken_call = ("
+
+
+@pytest.mark.unit
 def test_no_hits_falls_back_to_head():
     text = _big_file()
     ex = excerpt_text(text, keywords=["nothing_matches_this"], max_chars=600)
@@ -187,6 +200,15 @@ def test_gap_marker_wording():
 def test_anchors_from_python_traceback():
     err = 'Traceback:\n  File "pkg/mod.py", line 523\n    x = (\nSyntaxError: ...'
     assert error_line_anchors(err, "pkg/mod.py") == [523]
+
+
+@pytest.mark.unit
+def test_anchors_from_py_compile_indentation_error():
+    # py_compile formats IndentationError / TabError as `(path, line N)`
+    # rather than `File "path", line N`.
+    err = "Sorry: IndentationError: unexpected indent (pkg/mod.py, line 44)"
+    assert error_line_anchors(err, "pkg/mod.py") == [44]
+    assert error_line_anchors(err, "backend/pkg/mod.py") == [44]
 
 
 @pytest.mark.unit

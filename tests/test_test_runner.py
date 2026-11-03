@@ -166,6 +166,36 @@ async def test_timeout_in_syntax_classifies_as_fail(tmp_path):
 
 
 @pytest.mark.unit
+async def test_timeout_in_collect_tests_classifies_as_fail(tmp_path):
+    """A timeout during pytest collection (e.g. import-time infinite loop)
+    must classify as 'fail', not 'needs_env' (which Reviewer would accept)."""
+    ws, repo = _make_python_repo(tmp_path)
+    runner = _FakeRunner([
+        _ok(),
+        SandboxTimeoutError("collection hung"),
+    ])
+    result = await run_tests(
+        ws, repo, changed_files=["src.py"], runner=runner, timeout_s=10,
+    )
+    assert result.classification == "fail"
+    assert result.phases[1].timed_out is True
+    assert result.phases[1].exit_code == 124
+
+
+@pytest.mark.unit
+async def test_non_py_changed_file_in_python_repo_falls_back_to_bulk_syntax(tmp_path):
+    """Editing pyproject.toml or README.md in a Python project shouldn't
+    classify the repo as no_project (which makes Reviewer give up)."""
+    ws, repo = _make_python_repo(tmp_path)
+    runner = _FakeRunner([_ok(), _ok()])
+    result = await run_tests(
+        ws, repo, changed_files=["pyproject.toml"], runner=runner,
+    )
+    assert result.classification == "pass"
+    assert "src.py" in runner.calls[0]["command"]
+
+
+@pytest.mark.unit
 async def test_image_missing_classifies_as_error(tmp_path):
     ws, repo = _make_python_repo(tmp_path)
     runner = _FakeRunner([ImageMissingError("sandbox image not built")])

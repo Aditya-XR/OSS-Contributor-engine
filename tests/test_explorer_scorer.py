@@ -79,6 +79,21 @@ def test_extract_referenced_paths_picks_up_bare_filenames():
     assert "handlers.py" in refs
 
 
+@pytest.mark.unit
+def test_extract_referenced_paths_handles_multi_dot_and_dotted_dirs():
+    refs = extract_referenced_paths(
+        "Check `src/auth.controller.ts`, `.github/workflows/ci.yml`, "
+        "and `Button.stories.tsx`.",
+    )
+    assert "src/auth.controller.ts" in refs
+    assert ".github/workflows/ci.yml" in refs
+    assert "Button.stories.tsx" in refs
+    score, _ = referenced_score("src/auth.controller.ts", refs)
+    assert score == 1.0
+    score_base, _ = referenced_score("web/components/Button.stories.tsx", refs)
+    assert score_base == 0.7
+
+
 # ---------------------------------------------------------------------------
 # referenced_score
 # ---------------------------------------------------------------------------

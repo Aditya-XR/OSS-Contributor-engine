@@ -133,6 +133,18 @@ def excerpt_text(
             return True
         return False
 
+    def add_windows(indices: Sequence[int]) -> None:
+        for i in indices[:_MAX_WINDOWS]:
+            headers = _enclosing_headers(lines, i)
+            wide = [*headers, *range(i - before, i + after + 1)]
+            narrow = [*headers, *range(i - 2, i + 5)]
+            if (
+                not try_add(wide)
+                and not try_add(narrow)
+                and not try_add([*headers, i])
+            ):
+                try_add([i])
+
     # File head, one line at a time so a tiny budget still gets what fits.
     for i in range(min(head_lines, total)):
         if not try_add([i]):
@@ -147,12 +159,17 @@ def excerpt_text(
                 break
         return _finish(lines, included)
 
-    for i in ranked[:_MAX_WINDOWS]:
-        headers = _enclosing_headers(lines, i)
-        wide = [*headers, *range(i - before, i + after + 1)]
-        narrow = [*headers, *range(i - 2, i + 5)]
-        if not try_add(wide) and not try_add(narrow):
-            try_add([*headers, i])
+    add_windows(ranked)
+
+    # If a tight budget spent everything on the file head and dropped the
+    # highest-ranked anchor/keyword line, give the ranked matches first
+    # claim on the budget and fill the head with whatever room remains.
+    if not included[ranked[0]]:
+        included = [False] * total
+        add_windows(ranked)
+        for i in range(min(head_lines, total)):
+            if not included[i] and not try_add([i]):
+                break
 
     return _finish(lines, included)
 
@@ -160,7 +177,8 @@ def excerpt_text(
 def error_line_anchors(error_text: str, path: str) -> list[int]:
     """Line numbers (1-based) that `error_text` reports for the file `path`.
 
-    Understands Python tracebacks / py_compile (`File "pkg/mod.py", line 12`)
+    Understands Python tracebacks / py_compile (`File "pkg/mod.py", line 12`),
+    py_compile IndentationError/TabError (`(pkg/mod.py, line 12)`),
     and the `pkg/mod.py:12` / `src/x.ts:12:5` style most test runners and
     compilers print. Paths in error output may be absolute (`/workspace/...`)
     or relative to a sub-directory, so either side may be a suffix of the
@@ -171,7 +189,7 @@ def error_line_anchors(error_text: str, path: str) -> list[int]:
         return []
     want = path.replace("\\", "/").removeprefix("./")
     anchors: list[int] = []
-    for pattern in (_TRACEBACK_RE, _COLON_LINE_RE):
+    for pattern in (_TRACEBACK_RE, _PAREN_LINE_RE, _COLON_LINE_RE):
         for raw_path, raw_line in pattern.findall(error_text):
             got = raw_path.replace("\\", "/")
             if _same_file(got, want):
@@ -186,6 +204,7 @@ def error_line_anchors(error_text: str, path: str) -> list[int]:
 # ---------------------------------------------------------------------------
 
 _TRACEBACK_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_PAREN_LINE_RE = re.compile(r"\(([\w./\\-]+\.[A-Za-z0-9]+),\s*line\s+(\d+)\)")
 _COLON_LINE_RE = re.compile(r"([\w./\\-]+\.[A-Za-z0-9]+):(\d+)")
 
 

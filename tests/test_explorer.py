@@ -202,3 +202,23 @@ async def test_explore_records_telemetry(tmp_path):
     )
     assert result.files_scanned >= 1
     assert result.elapsed_s >= 0.0
+
+
+@pytest.mark.unit
+async def test_explore_extracts_referenced_path_from_title_and_ignores_cargo_lock(tmp_path):
+    _mkrepo(tmp_path, {
+        "Cargo.lock": "# lockfile",
+        "src/auth.controller.ts": "export function login() {}",
+        "src/other.ts": "export const x = 1;",
+    })
+    result = await explore(
+        repo="acme/widget",
+        repo_path=tmp_path,
+        issue_title="Fix crash in src/auth.controller.ts",
+        issue_body="",
+        router=None,
+    )
+    paths = [c.path for c in result.candidates]
+    assert "Cargo.lock" not in paths
+    assert paths[0] == "src/auth.controller.ts"
+    assert "ref:src/auth.controller.ts" in result.candidates[0].signals

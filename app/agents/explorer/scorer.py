@@ -40,13 +40,16 @@ _STOPWORDS: frozenset[str] = frozenset({
 })
 
 # A path-shaped token "looks like" `something/with.slashes` or
-# `something.with.dots`.
+# `something/with.multiple.dots.ts` (including leading-dot dirs like `.github/`).
 _PATHISH_RE = re.compile(
-    r"(?:[A-Za-z0-9_\-]+[/\\]){1,}[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9]+)?",
+    r"(?:\.?[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*[/\\])+"
+    r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*",
 )
 
-# A filename-shaped token "looks like" `something.ext`.
-_FILENAME_RE = re.compile(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,6}")
+# A filename-shaped token "looks like" `something.ext` or `foo.test.ts`.
+_FILENAME_RE = re.compile(
+    r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.[A-Za-z0-9]{1,6}",
+)
 
 
 def extract_keywords(text: str | None, *, limit: int = 40) -> list[str]:
