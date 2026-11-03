@@ -356,3 +356,85 @@ async def test_workspace_is_reset_between_attempts(tmp_path, monkeypatch):
     # After attempt 1 (decision=retry), git clean -fd should have removed
     # the untracked extra.py.
     assert not (repo / "extra.py").exists()
+
+
+@pytest.mark.integration
+async def test_workspace_reset_removes_intent_to_add_new_file(tmp_path):
+    """`capture_diff` runs `git add -N .` so brand-new files appear in the
+    diff. `_reset_workspace` must clear that intent-to-add index entry so
+    `git clean -fd` removes the new file before the next attempt."""
+    from app.agents.patcher.applier import apply_edits, capture_diff
+    from app.agents.patcher.schemas import CodeEdit
+    from app.agents.reviewer.reviewer import _reset_workspace
+
+    _, repo = _git_repo(tmp_path)
+    apply_edits(repo, [
+        CodeEdit(path="src/new_helper.py", search="", replace="def h():\n    pass\n"),
+    ])
+    diff = capture_diff(repo)
+    assert "src/new_helper.py" in diff
+    assert (repo / "src/new_helper.py").exists()
+
+    _reset_workspace(repo)
+    assert not (repo / "src/new_helper.py").exists()
+
+    # A second attempt can now create the same file without hitting
+    # "file already exists; refusing to clobber".
+    apply_edits(repo, [
+        CodeEdit(path="src/new_helper.py", search="", replace="def h():\n    return 1\n"),
+    ])
+    assert (repo / "src/new_helper.py").read_text() == "def h():\n    return 1\n"
+
+
+@pytest.mark.integration
+async def test_loop_retries_when_edit_apply_fails_then_accepts(tmp_path, monkeypatch):
+    ws, repo = _git_repo(tmp_path)
+    apply_fail = PatchResult(
+        success=False,
+        summary="try replacing y",
+        confidence=0.7,
+        edits_attempted=1,
+        edits_applied=[],
+        error="edit failed on src.py: search text not found in src.py.",
+    )
+    patcher = _FakePatcher([apply_fail, _patch_ok("diff #2")])
+    tester = _FakeTester([_test_pass()])
+    monkeypatch.setattr("app.agents.reviewer.reviewer.write_patch", patcher)
+    monkeypatch.setattr("app.agents.reviewer.reviewer.run_tests", tester)
+
+    result = await review_and_iterate(
+        repo="acme/x", repo_path=repo, workspace=ws,
+        issue_title="x", issue_body=None, issue_labels=[],
+        candidates=_candidates(), router=object(),
+        max_attempts=3,
+    )
+    assert result.success is True
+    assert len(result.attempts) == 2
+    assert result.attempts[0].decision == "retry"
+    assert result.attempts[1].decision == "accept"
+    assert result.accepted_attempt_number == 2
+    assert len(patcher.calls[1]["prior_attempts"]) == 1
+    assert "search text not found" in patcher.calls[1]["prior_attempts"][0].failure_excerpt
+
+
+@pytest.mark.integration
+async def test_loop_stops_when_diff_repeats_non_consecutively(tmp_path, monkeypatch):
+    ws, repo = _git_repo(tmp_path)
+    diff_a = "diff --git a/x b/x\n@@ diff A @@\n"
+    diff_b = "diff --git a/x b/x\n@@ diff B @@\n"
+    patcher = _FakePatcher([_patch_ok(diff_a), _patch_ok(diff_b), _patch_ok(diff_a)])
+    tester = _FakeTester([_test_fail("err A"), _test_fail("err B")])
+    monkeypatch.setattr("app.agents.reviewer.reviewer.write_patch", patcher)
+    monkeypatch.setattr("app.agents.reviewer.reviewer.run_tests", tester)
+
+    result = await review_and_iterate(
+        repo="acme/x", repo_path=repo, workspace=ws,
+        issue_title="x", issue_body=None, issue_labels=[],
+        candidates=_candidates(), router=object(),
+        max_attempts=3,
+    )
+    assert result.success is False
+    assert len(result.attempts) == 3
+    assert result.attempts[2].decision == "give_up"
+    assert "same diff" in result.attempts[2].decision_reason
+    assert tester.calls == 2

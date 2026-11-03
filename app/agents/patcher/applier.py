@@ -19,29 +19,57 @@ log = structlog.get_logger(__name__)
 def apply_edits(repo_path: Path, edits: list[CodeEdit]) -> list[AppliedEdit]:
     """Apply each edit in order. Raise EditApplyError on the first failure.
 
+    If a later edit in the batch fails, any earlier edits in the same call
+    are rolled back so the workspace isn't left half-patched.
+
     Failure modes intentionally surfaced:
       - search text not found
       - search text appears more than once (ambiguous — refuse rather than
         guess wrong)
       - search non-empty but file doesn't exist
       - search empty but file already exists (would clobber)
-      - escape attempts (paths containing `..` or absolute paths)
+      - escape attempts (paths containing `..`, `.git`, or absolute paths)
     """
     applied: list[AppliedEdit] = []
-    for edit in edits:
-        rel = _validate_rel_path(edit.path)
-        full = (repo_path / rel).resolve()
-        # Defense in depth: re-check after resolve that we're still inside
-        # the workspace. Symlinks + ../ traversal could otherwise escape.
-        if not _is_inside(full, repo_path.resolve()):
-            raise EditApplyError(
-                f"path escapes workspace: {edit.path}", path=edit.path,
-            )
+    # Map each touched path to its original bytes before the first edit in
+    # this batch (or None if the file did not exist before this batch).
+    snapshots: dict[Path, bytes | None] = {}
+    repo_root = repo_path.resolve()
 
-        if not edit.search:
-            applied.append(_apply_new_file(full, edit))
-        else:
-            applied.append(_apply_replace(full, edit))
+    try:
+        for edit in edits:
+            rel = _validate_rel_path(edit.path)
+            full = (repo_path / rel).resolve()
+            # Defense in depth: re-check after resolve that we're still inside
+            # the workspace. Symlinks + ../ traversal could otherwise escape.
+            if not _is_inside(full, repo_root):
+                raise EditApplyError(
+                    f"path escapes workspace: {edit.path}", path=edit.path,
+                )
+
+            if full not in snapshots:
+                snapshots[full] = full.read_bytes() if full.is_file() else None
+
+            if not edit.search:
+                applied.append(_apply_new_file(full, edit))
+            else:
+                applied.append(_apply_replace(full, edit))
+    except EditApplyError:
+        for path, original_bytes in reversed(list(snapshots.items())):
+            try:
+                if original_bytes is None:
+                    if path.is_file():
+                        path.unlink()
+                else:
+                    path.write_bytes(original_bytes)
+            except OSError as rollback_err:
+                log.warning(
+                    "patcher_rollback_failed",
+                    path=str(path),
+                    error=str(rollback_err),
+                )
+        raise
+
     return applied
 
 
@@ -152,22 +180,9 @@ def capture_diff(repo_path: Path, *, max_bytes: int = 200_000) -> str:
     # Stage everything to a temporary index just for the diff, then capture
     # again. We use `git add -N` (intent-to-add) so new files show up in
     # diff but aren't fully staged — keeps the workspace in a sensible state.
-    proc_add = subprocess.run(
-        ["git", "add", "-N", "."],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-    )
-    if proc_add.returncode != 0:
-        log.warning("patcher_git_add_n_failed", stderr=proc_add.stderr[:200])
-        # Continue with what we had — partial diff is better than no diff.
-        diff_text = proc.stdout
-    else:
-        proc2 = subprocess.run(
-            ["git", "diff", "--no-color", "--unified=4", "HEAD"],
+    try:
+        proc_add = subprocess.run(
+            ["git", "add", "-N", "."],
             cwd=repo_path,
             capture_output=True,
             text=True,
@@ -175,7 +190,25 @@ def capture_diff(repo_path: Path, *, max_bytes: int = 200_000) -> str:
             errors="replace",
             timeout=30,
         )
-        diff_text = proc2.stdout if proc2.returncode == 0 else proc.stdout
+        if proc_add.returncode != 0:
+            log.warning("patcher_git_add_n_failed", stderr=proc_add.stderr[:200])
+            # Continue with what we had — partial diff is better than no diff.
+            diff_text = proc.stdout
+        else:
+            proc2 = subprocess.run(
+                ["git", "diff", "--no-color", "--unified=4", "HEAD"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            diff_text = proc2.stdout if proc2.returncode == 0 else proc.stdout
+    except FileNotFoundError as e:
+        raise EditApplyError("`git` not on PATH; can't capture diff") from e
+    except subprocess.TimeoutExpired as e:
+        raise EditApplyError("`git diff` timed out") from e
 
     if len(diff_text.encode("utf-8")) > max_bytes:
         return (
@@ -199,6 +232,8 @@ def _validate_rel_path(path: str) -> str:
     parts = p.split("/")
     if ".." in parts:
         raise EditApplyError(f"`..` not allowed in path: {path}", path=path)
+    if any(part.lower() == ".git" for part in parts):
+        raise EditApplyError(f"`.git` not allowed in path: {path}", path=path)
     return p
 
 

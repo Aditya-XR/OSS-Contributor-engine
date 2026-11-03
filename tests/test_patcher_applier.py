@@ -129,6 +129,7 @@ def test_new_file_refuses_to_clobber(tmp_path):
 @pytest.mark.parametrize("bad_path", [
     "../escape.py", "/etc/passwd", "C:/Windows/System32/foo.txt",
     "ok/../../escape.py", "",
+    ".git/config", ".git/hooks/pre-commit", "sub/.git/config", ".GIT/config",
 ])
 def test_path_validation_rejects_escapes(tmp_path, bad_path):
     with pytest.raises(EditApplyError):
@@ -147,6 +148,20 @@ def test_stops_at_first_failure(tmp_path):
         ])
     # b.py should be UNMODIFIED because we never got to it.
     assert (tmp_path / "b.py").read_text() == "world\n"
+
+
+@pytest.mark.unit
+def test_failed_multi_edit_rolls_back_earlier_edits(tmp_path):
+    _seed(tmp_path, {"a.py": "alpha\n", "b.py": "beta\n"})
+    with pytest.raises(EditApplyError, match="not found"):
+        apply_edits(tmp_path, [
+            CodeEdit(path="a.py", search="alpha", replace="MODIFIED"),
+            CodeEdit(path="created.py", search="", replace="new file\n"),
+            CodeEdit(path="b.py", search="MISSING", replace="BETA"),
+        ])
+    assert (tmp_path / "a.py").read_text() == "alpha\n"
+    assert not (tmp_path / "created.py").exists()
+    assert (tmp_path / "b.py").read_text() == "beta\n"
 
 
 @pytest.mark.unit
