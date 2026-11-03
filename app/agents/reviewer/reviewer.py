@@ -107,20 +107,20 @@ async def review_and_iterate(
             session=session,
         )
 
-        # Patch didn't even apply — nothing to test. Give up cleanly.
+        # Patch didn't apply cleanly — decide whether to give up or retry.
         if not patch.success:
-            attempt = Attempt(
-                attempt_number=n,
-                patch_result=patch,
-                test_result=None,
-                decision="give_up",
-                decision_reason=patch.error or "patch generation failed",
-            )
-            attempts.append(attempt)
             # Rate-limit is a capacity wall, not a real failure — retrying
             # immediately just hits the same wall. Stop and propagate the flag
             # so the Pilot reports 'rate_limited' (retry) not 'rejected'.
             if patch.rate_limited:
+                attempt = Attempt(
+                    attempt_number=n,
+                    patch_result=patch,
+                    test_result=None,
+                    decision="give_up",
+                    decision_reason=patch.error or "patch generation failed",
+                )
+                attempts.append(attempt)
                 return _make_result(
                     success=False,
                     summary=(
@@ -131,6 +131,35 @@ async def review_and_iterate(
                     rate_limited=True,
                     elapsed=time.monotonic() - started,
                 )
+            # The LLM proposed edits, but `apply_edits` rejected them (e.g.
+            # search snippet not found or ambiguous). Feed the applier error
+            # back into the next attempt so the model can add context.
+            if patch.edits_attempted > 0:
+                reason = patch.error or "edit failed to apply"
+                attempt = Attempt(
+                    attempt_number=n,
+                    patch_result=patch,
+                    test_result=None,
+                    decision="retry",
+                    decision_reason=reason,
+                )
+                attempts.append(attempt)
+                prior.append(PriorAttempt(
+                    attempt_number=n,
+                    summary=patch.summary or "(no summary)",
+                    failure_excerpt=reason,
+                    edits_applied_paths=[e.path for e in patch.edits_applied],
+                ))
+                _reset_workspace(repo_path)
+                continue
+            attempt = Attempt(
+                attempt_number=n,
+                patch_result=patch,
+                test_result=None,
+                decision="give_up",
+                decision_reason=patch.error or "patch generation failed",
+            )
+            attempts.append(attempt)
             return _make_result(
                 success=False,
                 summary=f"Patch generation failed on attempt {n}: {patch.error}",
@@ -138,9 +167,13 @@ async def review_and_iterate(
                 elapsed=time.monotonic() - started,
             )
 
-        # Bail if this attempt's diff is identical to the previous one's.
+        # Bail if this attempt's diff is identical to a previous one's.
         # LLM is stuck — burning more tokens won't break the cycle.
-        if attempts and patch.unified_diff == attempts[-1].patch_result.unified_diff:
+        if any(
+            a.patch_result.success
+            and patch.unified_diff == a.patch_result.unified_diff
+            for a in attempts
+        ):
             log.warning("reviewer_diff_loop_detected", repo=repo, attempt=n)
             attempt = Attempt(
                 attempt_number=n,
@@ -212,11 +245,16 @@ async def review_and_iterate(
         _reset_workspace(repo_path)
 
     # Ran out of attempts.
+    last_cls = (
+        attempts[-1].test_result.classification
+        if attempts and attempts[-1].test_result
+        else "n/a"
+    )
     return _make_result(
         success=False,
         summary=(
             f"Out of attempts ({max_attempts}). Last classification: "
-            f"{attempts[-1].test_result.classification if attempts[-1].test_result else 'n/a'}."
+            f"{last_cls}."
         ),
         attempts=attempts,
         elapsed=time.monotonic() - started,
@@ -268,15 +306,18 @@ def _to_prior(
 def _reset_workspace(repo_path: Path) -> None:
     """Revert all uncommitted changes + drop new files.
 
+    `git reset -q` clears intent-to-add entries (`git add -N .` from
+    `capture_diff`) so new files become untracked again.
     `git restore .` undoes modifications to tracked files.
     `git clean -fd` removes untracked files + dirs (where the LLM created
     new files like `src/helper.py`).
 
-    Best-effort: if either command fails we log + continue. The next
+    Best-effort: if any command fails we log + continue. The next
     patch attempt may produce a confusing result (stacked edits), but
     that's still surfaced via the diff so the loop can detect it.
     """
     for argv in (
+        ["git", "reset", "-q"],
         ["git", "restore", "."],
         ["git", "clean", "-fd"],
     ):
