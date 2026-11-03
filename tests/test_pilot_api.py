@@ -41,6 +41,20 @@ def _seed_inv(
     return inv
 
 
+@pytest.fixture(autouse=True)
+def _pilot_route_env(api_app, monkeypatch):
+    """Keep these tests independent of the developer's `.env`.
+
+    `create_pilot` depends on `get_llm_router`, which lazily builds a real
+    router from GEMINI_API_KEY / GROQ_API_KEY and answers 503 when neither
+    is set (a fresh clone, CI). And a local `PILOT_ENABLED=false` would 503
+    every request too. The spawn is patched out, so the router is never
+    called: any non-None object will do.
+    """
+    monkeypatch.setattr("app.api.routes.pilot.settings.pilot_enabled", True)
+    api_app.state.llm_router = object()
+
+
 @pytest.fixture
 def patched_spawn(monkeypatch):
     """Stub out the pilot's background spawn so the test doesn't fire
