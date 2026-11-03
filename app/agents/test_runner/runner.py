@@ -33,6 +33,7 @@ from app.agents.test_runner.schemas import (
     TestRunResult,
 )
 from app.sandbox import (
+    DockerNotAvailableError,
     ImageMissingError,
     SandboxRunError,
     SandboxRunner,
@@ -118,9 +119,19 @@ async def run_tests(
         subdir=info.subdir,
         changed_files=changed_files,
     )
+    if not syntax_files and changed_files:
+        # The patch touched only non-.py files (e.g. pyproject.toml, README.md,
+        # .yaml, .pyi) or files outside the detected subdir. Fall back to the
+        # bulk .py scan so we still verify the Python project's syntax and
+        # test collection rather than misclassifying the repo as no_project.
+        syntax_files = _resolve_syntax_targets(
+            repo_path=repo_path,
+            subdir=info.subdir,
+            changed_files=None,
+        )
     if not syntax_files:
-        # Edge case: detected Python but found no .py files (header-only
-        # project, all-stubs, or the changed_files list referred to non-py).
+        # Edge case: detected Python but found no .py files anywhere in the
+        # project (header-only or all-stubs).
         return TestRunResult(
             language="python",
             classification="no_project",
@@ -196,6 +207,16 @@ async def run_tests(
             duration_s=time.monotonic() - started,
         )
 
+    if collect_phase.timed_out:
+        return TestRunResult(
+            language="python",
+            classification="fail",
+            summary="pytest collection timed out — patch may have introduced an import-time hang.",
+            phases=[syntax_phase, collect_phase],
+            duration_s=time.monotonic() - started,
+            failure_excerpt=_excerpt(collect_phase),
+        )
+
     # Collect failed but syntax was fine — almost always means the project's
     # imports need `pip install -e .`, which the sandbox doesn't do yet.
     # Surface it as 'needs_env' so the Reviewer doesn't retry the patch
@@ -248,7 +269,7 @@ async def _run_phase(
             stderr=f"(timed out after {timeout_s}s)",
             timed_out=True,
         )
-    except (ImageMissingError, SandboxRunError) as e:
+    except (DockerNotAvailableError, ImageMissingError, SandboxRunError) as e:
         log.warning("test_runner_phase_infra_error", name=name, error=str(e))
         return None
 

@@ -12,7 +12,7 @@ IGNORE_FRAGMENTS: tuple[str, ...] = (
     "/node_modules/", "/dist/", "/build/", "/.git/", "/.next/", "/.venv/",
     "/__pycache__/", "/vendor/", "/target/", "/out/",
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-    "uv.lock", "Cargo.lock", ".min.js", ".min.css",
+    "uv.lock", "cargo.lock", ".min.js", ".min.css",
 )
 
 # Extensions worth handing to an agent. Adding a new source language?

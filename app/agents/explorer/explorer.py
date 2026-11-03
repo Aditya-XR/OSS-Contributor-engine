@@ -104,7 +104,7 @@ async def explore(
     started = time.monotonic()
     full_text = " ".join([issue_title, issue_body or ""])
     keywords = extract_keywords(full_text)
-    references = extract_referenced_paths(issue_body)
+    references = extract_referenced_paths(full_text)
 
     log.info(
         "explorer_start",
@@ -197,8 +197,11 @@ async def explore(
         ]
     else:
         signals_by_path = {s.path: s for s in scanned}
+        seen_paths: set[str] = set()
         final = []
         for item in parsed.candidates:
+            if item.path in seen_paths:
+                continue
             scanned_match = signals_by_path.get(item.path)
             if scanned_match is None:
                 # Hallucinated path — drop it (this is exactly why we tell
@@ -208,6 +211,7 @@ async def explore(
                     repo=repo, path=item.path,
                 )
                 continue
+            seen_paths.add(item.path)
             final.append(FileCandidate(
                 path=item.path,
                 confidence=item.confidence,
