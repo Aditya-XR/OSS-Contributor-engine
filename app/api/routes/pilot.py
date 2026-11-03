@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import RouterDep, SessionDep, UserGHDep
 from app.auth.dependencies import CurrentUserDep
 from app.core.config import settings
-from app.db.models import Investigation, Issue, PilotRun, Repo, User
+from app.db.models import Investigation, PilotRun, User
 from app.db.session import sessionmaker_factory
 from app.jobs import spawn
 from app.pilot import (
